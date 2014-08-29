@@ -3,10 +3,8 @@ Robotic browser.
 """
 
 import re
-import requests
 from bs4 import BeautifulSoup
 from bs4.element import Tag
-from requests.exceptions import RequestException
 
 from robobrowser import helpers
 from robobrowser import exceptions
@@ -15,9 +13,146 @@ from robobrowser.forms.form import Form
 from robobrowser.cache import RoboHTTPAdapter
 from robobrowser.helpers import retry
 
+import pycurl, curl, io
+from urllib.parse import urlencode
+import zlib
 
 _link_ptn = re.compile(r'^(a|button)$', re.I)
 _form_ptn = re.compile(r'^form$', re.I)
+
+
+class DeflateDecoder(object):
+
+    def __init__(self):
+        self._first_try = True
+        self._data = binary_type()
+        self._obj = zlib.decompressobj()
+
+    def __getattr__(self, name):
+        return getattr(self._obj, name)
+
+    def decompress(self, data):
+        if not self._first_try:
+            return self._obj.decompress(data)
+
+        self._data += data
+        try:
+            return self._obj.decompress(data)
+        except zlib.error:
+            self._first_try = False
+            self._obj = zlib.decompressobj(-zlib.MAX_WBITS)
+            try:
+                return self.decompress(self._data)
+            finally:
+                self._data = None
+
+
+def _get_decoder(mode):
+    if mode == 'gzip':
+        return zlib.decompressobj(16 + zlib.MAX_WBITS)
+
+    return DeflateDecoder()
+
+class RoboCurl(object):
+    def __init__(self):
+        self.c = None
+        self.reset()
+
+    def reset(self):
+        if self.c is not None:
+            self.c.close()
+
+        self.hdr = ""
+        self.headers = {}
+        self.payload = ""
+
+        self.c = pycurl.Curl()
+        self.c.setopt(pycurl.TIMEOUT, 40)
+        self.c.setopt(pycurl.FOLLOWLOCATION, 1)
+        self.c.setopt(pycurl.MAXREDIRS, 5)
+        self.c.setopt(pycurl.COOKIEFILE, "/dev/null")
+        self.c.setopt(pycurl.ENCODING, 'gzip, deflate')
+
+        def header_callback(x):
+            self.hdr += x.decode('ascii')
+        self.set_option(pycurl.HEADERFUNCTION, header_callback)
+
+    def set_socks(self, addr, port):
+        self.c.setopt(pycurl.PROXY, addr)
+        self.c.setopt(pycurl.PROXYPORT, port)
+        self.c.setopt(pycurl.PROXYTYPE, pycurl.PROXYTYPE_SOCKS5)
+
+    def _do_request(self, url, headers=None):
+        self.hdr = ""
+        self.headers = {}
+
+        buf = io.BytesIO()
+        self.c.setopt(pycurl.WRITEDATA, buf)
+        self.c.setopt(pycurl.URL, url)
+        if headers:
+            self.c.setopt(pycurl.HTTPHEADER, headers)
+
+        self.c.perform()
+        self.payload = buf.getvalue()
+
+        if headers:
+            empty_headers = []
+            for header in headers:
+                if ":" not in header:
+                    continue
+                name, _ = headers.split(":", 1)
+                empty_headers.append(name+":")
+            self.c.setopt(pycurl.HTTPHEADER, empty_headers)
+
+        self.headers = self.parse_headers(self.hdr)
+        encoding = self.headers.get('content-encoding', '')
+        if encoding in ('gzip', 'deflate'):
+            decoder = _get_decoder(encoding)
+            self.payload = decoder.decompress(self.payload)
+        return self.payload
+
+    def parse_headers(self, headers):
+        d = {}
+        first = True
+        for line in headers.split("\r\n"):
+            if first:
+                first = False
+                self.status_line = line
+            if ":" not in line:
+                continue
+            name, value = line.split(":", 1)
+            d[name.lower()] = value.strip()
+        return d
+
+    def get(self, url, headers=None):
+        self.c.setopt(pycurl.HTTPGET, 1)
+        return self._do_request(url, headers)
+
+    def post(self, url, params, headers=None):
+        self.c.setopt(pycurl.POST, 1)
+        self.c.setopt(pycurl.POSTFIELDS, urlencode(params))
+        return self._do_request(url, headers)
+
+    def set_timeout(self, timeout):
+        self.c.setopt(pycurl.TIMEOUT, timeout)
+
+    def set_option(self, *args):
+        self.c.setopt(*args)
+    
+    def set_verbosity(self, level):
+        self.set_option(pycurl.VERBOSE, level)
+
+    @property
+    def url(self):
+        return self.c.getinfo(pycurl.EFFECTIVE_URL)
+
+
+class RoboResponse(object):
+    def __init__(self, session):
+        self.content = session.payload
+        self.url = session.url
+        self.status_line = ""
+        self.headers = session.headers
 
 
 class RoboState(object):
@@ -29,7 +164,7 @@ class RoboState(object):
     def __init__(self, browser, response):
         self.browser = browser
         self.response = response
-        self.url = response.url
+        self.url = self.response.url
         self._parsed = None
 
     @property
@@ -58,11 +193,6 @@ class RoboBrowser(object):
     :param int timeout: Default timeout, in seconds
     :param bool allow_redirects: Allow redirects on POST/PUT/DELETE
 
-    :param bool cache: Cache responses
-    :param list cache_patterns: List of URL patterns for cache
-    :param timedelta max_age: Max age for cache
-    :param int max_count: Max count for cache
-
     :param int tries: Number of retries
     :param Exception errors: Exception or tuple of exceptions to catch
     :param int delay: Delay between retries
@@ -70,33 +200,21 @@ class RoboBrowser(object):
 
     """
     def __init__(self, session=None, parser=None, user_agent=None,
-                 history=True, timeout=None, allow_redirects=True, cache=False,
-                 cache_patterns=None, max_age=None, max_count=None, tries=None,
-                 errors=RequestException, delay=None, multiplier=None):
+                 history=True, timeout=None, allow_redirects=True, tries=None,
+                 errors=pycurl.error, delay=None, multiplier=None):
 
-        self.session = session or requests.Session()
+        self.session = session or RoboCurl()
 
         # Add default user agent string
         if user_agent is not None:
-            self.session.headers['User-Agent'] = user_agent
+            self.session.set_option(pycurl.USERAGENT, user_agent)
 
         self.parser = parser
-
-        self.timeout = timeout
-        self.allow_redirects = allow_redirects
-
-        # Set up caching
-        if cache:
-            adapter = RoboHTTPAdapter(max_age=max_age, max_count=max_count)
-            cache_patterns = cache_patterns or ['http://', 'https://']
-            for pattern in cache_patterns:
-                self.session.mount(pattern, adapter)
-        elif max_age:
-            raise ValueError('Parameter `max_age` is provided, '
-                             'but caching is turned off')
-        elif max_count:
-            raise ValueError('Parameter `max_count` is provided, '
-                             'but caching is turned off')
+        if timeout is not None:
+            self.session.set_timeout(timeout)
+        
+        self.session.set_option(pycurl.FOLLOWLOCATION, 
+            1 if allow_redirects else 0)
 
         # Configure history
         self.history = history
@@ -185,8 +303,8 @@ class RoboBrowser(object):
 
         """
         return {
-            'timeout': self.timeout,
-            'allow_redirects': self.allow_redirects,
+            # 'timeout': self.timeout,
+            # 'allow_redirects': self.allow_redirects,
         }
 
     def _build_send_args(self, **kwargs):
@@ -209,7 +327,7 @@ class RoboBrowser(object):
         response = self.session.get(url, **self._build_send_args(**kwargs))
         self._update_state(response)
 
-    def _update_state(self, response):
+    def _update_state(self, content):
         """Update the state of the browser. Create a new state object, and
         append to or overwrite the browser's state history.
 
@@ -220,6 +338,8 @@ class RoboBrowser(object):
         self._states = self._states[:self._cursor + 1]
 
         # Append new state
+        response = RoboResponse(self.session)
+
         state = RoboState(self, response)
         self._states.append(state)
         self._cursor += 1
@@ -341,10 +461,21 @@ class RoboBrowser(object):
         # Send request
         url = self._build_url(form.action) or self.url
         payload = form.serialize(submit=submit)
+        
         serialized = payload.to_requests(method)
-        send_args = self._build_send_args(**kwargs)
-        send_args.update(serialized)
-        response = self.session.request(method, url, **send_args)
+        params = {k:v for k,v in serialized['data']}
+
+        # send_args = self._build_send_args(**kwargs)
+        # send_args.update(serialized)
+        
+        meth = self.session.get
+        if method == "POST":
+            meth = self.session.post
+        
+        self.session.payload = ""
+        self.session.hdr = ""
+
+        response = meth(url, params)
 
         # Update history
         self._update_state(response)

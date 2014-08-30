@@ -53,6 +53,7 @@ def _get_decoder(mode):
 
     return DeflateDecoder()
 
+
 class RoboCurl(object):
     def __init__(self):
         self.c = None
@@ -100,7 +101,7 @@ class RoboCurl(object):
             for header in headers:
                 if ":" not in header:
                     continue
-                name, _ = headers.split(":", 1)
+                name, _ = header.split(":", 1)
                 empty_headers.append(name+":")
             self.c.setopt(pycurl.HTTPHEADER, empty_headers)
 
